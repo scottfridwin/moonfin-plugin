@@ -259,6 +259,152 @@ public class JellyseerrSessionService
     }
 
     /// <summary>
+    /// Authenticates a Jellyfin user with Seerr using an incoming Jellyfin Authorization header.
+    /// This allows token-based SSO where the plugin forwards the Jellyfin token to Seerr.
+    /// </summary>
+    public async Task<JellyseerrAuthResult?> AuthenticateWithJellyfinTokenAsync(Guid userId, string jellyfinAuthorizationHeader, string? authType = null)
+    {
+        var config = MoonfinPlugin.Instance?.Configuration;
+        var jellyseerrUrl = config?.GetEffectiveJellyseerrUrl();
+
+        if (string.IsNullOrEmpty(jellyseerrUrl))
+        {
+            _logger.LogError("Seerr URL not configured");
+            return null;
+        }
+
+        try
+        {
+            var cookieContainer = new CookieContainer();
+            using var handler = new HttpClientHandler
+            {
+                CookieContainer = cookieContainer,
+                UseCookies = true
+            };
+            using var client = new HttpClient(handler);
+            client.Timeout = TimeSpan.FromSeconds(15);
+
+            var isLocal = string.Equals(authType, "local", StringComparison.OrdinalIgnoreCase);
+            var authEndpoint = isLocal
+                ? $"{jellyseerrUrl}/api/v1/auth/local"
+                : $"{jellyseerrUrl}/api/v1/auth/jellyfin";
+
+            var csrfToken = await FetchCsrfTokenAsync(client, jellyseerrUrl, cookieContainer);
+
+            var request = new HttpRequestMessage(HttpMethod.Post, authEndpoint);
+            // Forward the Jellyfin Authorization header (e.g. MediaBrowser Token="...")
+            if (!string.IsNullOrEmpty(jellyfinAuthorizationHeader))
+            {
+                request.Headers.Add("Authorization", jellyfinAuthorizationHeader);
+            }
+
+            if (!string.IsNullOrEmpty(csrfToken))
+            {
+                request.Headers.Add("X-CSRF-Token", csrfToken);
+            }
+
+            // Some Seerr setups may expect JSON; send an empty object payload
+            request.Content = new StringContent("{}", Encoding.UTF8, "application/json");
+
+            var response = await client.SendAsync(request);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var errorBody = await response.Content.ReadAsStringAsync();
+                _logger.LogWarning("Seerr token auth failed for user {UserId}: {Status} - {Error}",
+                    userId, response.StatusCode, errorBody);
+                return new JellyseerrAuthResult
+                {
+                    Success = false,
+                    Error = response.StatusCode == HttpStatusCode.Forbidden
+                        ? "Access denied. Make sure plugin and Seerr are configured for Jellyfin SSO."
+                        : $"Authentication failed: {response.StatusCode}"
+                };
+            }
+
+            // Extract session cookie
+            var cookies = cookieContainer.GetCookies(new Uri(jellyseerrUrl));
+            var sessionCookie = cookies["connect.sid"]?.Value;
+
+            if (string.IsNullOrEmpty(sessionCookie) &&
+                response.Headers.TryGetValues("Set-Cookie", out var setCookieHeaders))
+            {
+                foreach (var header in setCookieHeaders)
+                {
+                    if (header.StartsWith("connect.sid=", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var value = header.Substring("connect.sid=".Length);
+                        var semicolonIdx = value.IndexOf(';');
+                        if (semicolonIdx > 0) value = value.Substring(0, semicolonIdx);
+                        sessionCookie = Uri.UnescapeDataString(value);
+                        _logger.LogInformation("Extracted connect.sid from Set-Cookie header (CookieContainer fallback)");
+                        break;
+                    }
+                }
+            }
+
+            if (string.IsNullOrEmpty(sessionCookie))
+            {
+                _logger.LogWarning("No session cookie received from Seerr for user {UserId} via token auth", userId);
+                return new JellyseerrAuthResult
+                {
+                    Success = false,
+                    Error = "No session cookie received from Seerr"
+                };
+            }
+
+            // Parse the user response
+            var responseBody = await response.Content.ReadAsStringAsync();
+            var userInfo = JsonSerializer.Deserialize<JsonElement>(responseBody);
+
+            // Store the session
+            var session = new JellyseerrSession
+            {
+                JellyfinUserId = userId,
+                SessionCookie = sessionCookie,
+                JellyseerrUserId = userInfo.TryGetProperty("id", out var idProp) ? idProp.GetInt32() : 0,
+                Username = userInfo.TryGetProperty("username", out var unProp) ? unProp.GetString() ?? string.Empty : string.Empty,
+                DisplayName = userInfo.TryGetProperty("displayName", out var dnProp) ? dnProp.GetString() : null,
+                Avatar = userInfo.TryGetProperty("avatar", out var avProp) ? avProp.GetString() : null,
+                Permissions = userInfo.TryGetProperty("permissions", out var permProp) ? permProp.GetInt32() : 0,
+                CreatedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                LastValidated = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+            };
+
+            await SaveSessionAsync(session);
+
+            _logger.LogInformation("Seerr SSO session created for Jellyfin user {UserId} via token auth", userId);
+
+            return new JellyseerrAuthResult
+            {
+                Success = true,
+                JellyseerrUserId = session.JellyseerrUserId,
+                DisplayName = session.DisplayName,
+                Avatar = session.Avatar,
+                Permissions = session.Permissions
+            };
+        }
+        catch (HttpRequestException ex)
+        {
+            _logger.LogError(ex, "Failed to connect to Seerr at {Url}", jellyseerrUrl);
+            return new JellyseerrAuthResult
+            {
+                Success = false,
+                Error = $"Cannot reach Seerr: {ex.Message}"
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Unexpected error during Seerr token auth for user {UserId}", userId);
+            return new JellyseerrAuthResult
+            {
+                Success = false,
+                Error = "An unexpected error occurred"
+            };
+        }
+    }
+
+    /// <summary>
     /// Gets the stored session for a user, optionally validating it.
     /// </summary>
     public async Task<JellyseerrSession?> GetSessionAsync(Guid userId, bool validate = false)

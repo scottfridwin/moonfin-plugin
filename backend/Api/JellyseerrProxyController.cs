@@ -52,9 +52,36 @@ public class JellyseerrProxyController : ControllerBase
             return Unauthorized(new { error = "User not authenticated" });
         }
 
+        // If no username provided, attempt token-based auth using the incoming
+        // Authorization header (MediaBrowser token) forwarded by the Jellyfin server.
         if (string.IsNullOrEmpty(request.Username))
         {
-            return BadRequest(new { error = "Username is required" });
+            var authHeader = Request.Headers["Authorization"].FirstOrDefault();
+            if (string.IsNullOrEmpty(authHeader))
+            {
+                return BadRequest(new { error = "Username is required or Authorization header must be present for token-based SSO" });
+            }
+
+            var result = await _sessionService.AuthenticateWithJellyfinTokenAsync(
+                userId.Value, authHeader, request.AuthType);
+
+            if (result == null || !result.Success)
+            {
+                return Unauthorized(new
+                {
+                    error = result?.Error ?? "Authentication failed",
+                    success = false
+                });
+            }
+
+            return Ok(new
+            {
+                success = true,
+                jellyseerrUserId = result.JellyseerrUserId,
+                displayName = result.DisplayName,
+                avatar = result.Avatar,
+                permissions = result.Permissions
+            });
         }
 
         var result = await _sessionService.AuthenticateAsync(

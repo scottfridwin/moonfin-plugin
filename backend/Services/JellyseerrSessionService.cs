@@ -275,6 +275,11 @@ public class JellyseerrSessionService
 
         try
         {
+            _logger.LogInformation(
+                "Attempting Seerr token auth for user {UserId}. Header present: {HasHeader}",
+                userId,
+                !string.IsNullOrEmpty(jellyfinAuthorizationHeader));
+
             var cookieContainer = new CookieContainer();
             using var handler = new HttpClientHandler
             {
@@ -311,14 +316,14 @@ public class JellyseerrSessionService
             if (!response.IsSuccessStatusCode)
             {
                 var errorBody = await response.Content.ReadAsStringAsync();
-                _logger.LogWarning("Seerr token auth failed for user {UserId}: {Status} - {Error}",
+                _logger.LogWarning("Seerr token auth failed for user {UserId}: {Status} - {ErrorBody}",
                     userId, response.StatusCode, errorBody);
                 return new JellyseerrAuthResult
                 {
                     Success = false,
                     Error = response.StatusCode == HttpStatusCode.Forbidden
                         ? "Access denied. Make sure plugin and Seerr are configured for Jellyfin SSO."
-                        : $"Authentication failed: {response.StatusCode}"
+                        : $"Authentication failed: {response.StatusCode}: {errorBody}"
                 };
             }
 

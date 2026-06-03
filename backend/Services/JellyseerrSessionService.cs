@@ -259,6 +259,15 @@ public class JellyseerrSessionService
         }
     }
 
+    /// <summary>
+    /// Starts an OIDC login by calling Seerr's OIDC login endpoint and storing correlation cookies.
+    /// </summary>
+    /// <param name="userId">The Jellyfin user ID starting the OIDC login.</param>
+    /// <param name="slug">The OIDC provider slug.</param>
+    /// <param name="returnUrl">Optional return URL to pass to Seerr.</param>
+    /// <returns>
+    /// The result of the OIDC login initiation, including the redirect URL or error details.
+    /// </returns>
     public async Task<JellyseerrOidcLoginResult> StartOidcLoginAsync(Guid userId, string slug, string? returnUrl)
     {
         var config = MoonfinPlugin.Instance?.Configuration;
@@ -358,6 +367,15 @@ public class JellyseerrSessionService
         }
     }
 
+    /// <summary>
+    /// Completes an OIDC callback by posting the provider callback URL to Seerr and storing the resulting session.
+    /// </summary>
+    /// <param name="userId">The Jellyfin user ID completing the OIDC login.</param>
+    /// <param name="slug">The OIDC provider slug.</param>
+    /// <param name="callbackUrl">The full callback URL returned by the OIDC provider.</param>
+    /// <returns>
+    /// The authenticated Seerr user info if the OIDC callback completed successfully, otherwise error details.
+    /// </returns>
     public async Task<JellyseerrAuthResult> CompleteOidcCallbackAsync(Guid userId, string slug, string callbackUrl)
     {
         var config = MoonfinPlugin.Instance?.Configuration;
@@ -927,6 +945,9 @@ public class JellyseerrSessionService
     }
 }
 
+/// <summary>
+/// Temporarily stores the state for an ongoing Seerr OIDC login flow.
+/// </summary>
 public class JellyseerrOidcState
 {
     [JsonPropertyName("jellyfinUserId")]
@@ -945,10 +966,18 @@ public class JellyseerrOidcState
     public long CreatedAt { get; set; }
 }
 
+/// <summary>
+/// Result returned when an OIDC login is started.
+/// </summary>
 public class JellyseerrOidcLoginResult
 {
+    /// <summary>Whether the OIDC login initiation succeeded.</summary>
     public bool Success { get; set; }
+
+    /// <summary>Redirect URL returned by Seerr for the OIDC provider.</summary>
     public string? RedirectUrl { get; set; }
+
+    /// <summary>Error message if the login initiation failed.</summary>
     public string? Error { get; set; }
 }
 

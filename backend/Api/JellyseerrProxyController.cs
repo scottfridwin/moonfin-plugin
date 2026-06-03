@@ -83,11 +83,18 @@ public class JellyseerrProxyController : ControllerBase
     /// <summary>
     /// Initiate an OpenID Connect login flow through Seerr.
     /// </summary>
+    /// <param name="slug">The OIDC provider slug configured in Seerr.</param>
+    /// <param name="returnUrl">Optional return URL that Seerr should redirect to after authentication.</param>
+    /// <returns>
+    /// A JSON object containing the URL the client should use to continue the OIDC flow.
+    /// </returns>
     [HttpGet("Oidc/Login/{slug}")]
     [Authorize]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
     [ProducesResponseType(StatusCodes.Status503ServiceUnavailable)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> BeginOidcLogin(string slug, [FromQuery] string? returnUrl)
     {
         var config = MoonfinPlugin.Instance?.Configuration;
@@ -117,12 +124,18 @@ public class JellyseerrProxyController : ControllerBase
     /// <summary>
     /// Complete an OpenID Connect callback flow through Seerr.
     /// </summary>
+    /// <param name="slug">The OIDC provider slug configured in Seerr.</param>
+    /// <param name="request">The callback request payload containing the full callback URL.</param>
+    /// <returns>
+    /// A JSON object containing the authenticated Seerr user info or error details.
+    /// </returns>
     [HttpPost("Oidc/Callback/{slug}")]
     [Authorize]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
     [ProducesResponseType(StatusCodes.Status401Unauthorized)]
     [ProducesResponseType(StatusCodes.Status503ServiceUnavailable)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> CompleteOidcCallback(string slug, [FromBody] JellyseerrOidcCallbackRequest request)
     {
         var config = MoonfinPlugin.Instance?.Configuration;

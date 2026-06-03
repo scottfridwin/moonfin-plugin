@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Net;
 using System.Text;
 using System.Text.Json;
@@ -255,6 +256,376 @@ public class JellyseerrSessionService
                 Success = false,
                 Error = "An unexpected error occurred"
             };
+        }
+    }
+
+    public async Task<JellyseerrOidcLoginResult> StartOidcLoginAsync(Guid userId, string slug, string? returnUrl)
+    {
+        var config = MoonfinPlugin.Instance?.Configuration;
+        var jellyseerrUrl = config?.GetEffectiveJellyseerrUrl();
+
+        if (string.IsNullOrEmpty(jellyseerrUrl))
+        {
+            return new JellyseerrOidcLoginResult
+            {
+                Success = false,
+                Error = "Seerr URL not configured"
+            };
+        }
+
+        try
+        {
+            var cookieContainer = new CookieContainer();
+            using var handler = new HttpClientHandler
+            {
+                CookieContainer = cookieContainer,
+                UseCookies = true
+            };
+            using var client = new HttpClient(handler)
+            {
+                Timeout = TimeSpan.FromSeconds(15)
+            };
+
+            var loginUrl = $"{jellyseerrUrl}/auth/oidc/login/{Uri.EscapeDataString(slug)}";
+            if (!string.IsNullOrEmpty(returnUrl))
+            {
+                loginUrl += $"?returnUrl={Uri.EscapeDataString(returnUrl)}";
+            }
+
+            using var response = await client.GetAsync(loginUrl, HttpCompletionOption.ResponseHeadersRead);
+            if (!response.IsSuccessStatusCode)
+            {
+                var errorBody = await response.Content.ReadAsStringAsync();
+                _logger.LogWarning("Seerr OIDC login initiation failed for user {UserId}: {Status} - {Error}",
+                    userId, response.StatusCode, errorBody);
+
+                return new JellyseerrOidcLoginResult
+                {
+                    Success = false,
+                    Error = $"OIDC login initiation failed: {response.StatusCode}"
+                };
+            }
+
+            var responseBody = await response.Content.ReadAsStringAsync();
+            var payload = JsonSerializer.Deserialize<JsonElement>(responseBody);
+
+            if (!payload.TryGetProperty("redirectUrl", out var redirectElement) ||
+                redirectElement.ValueKind != JsonValueKind.String ||
+                string.IsNullOrEmpty(redirectElement.GetString()))
+            {
+                return new JellyseerrOidcLoginResult
+                {
+                    Success = false,
+                    Error = "Invalid OIDC login response from Seerr"
+                };
+            }
+
+            var redirectUrl = redirectElement.GetString()!;
+            var state = new JellyseerrOidcState
+            {
+                JellyfinUserId = userId,
+                Slug = slug,
+                ReturnUrl = returnUrl,
+                Cookies = GetCookiesFromResponse(response, cookieContainer, new Uri(jellyseerrUrl)),
+                CreatedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+            };
+
+            await SaveOidcStateAsync(state);
+
+            return new JellyseerrOidcLoginResult
+            {
+                Success = true,
+                RedirectUrl = redirectUrl
+            };
+        }
+        catch (HttpRequestException ex)
+        {
+            _logger.LogError(ex, "Failed to connect to Seerr at {Url}", jellyseerrUrl);
+            return new JellyseerrOidcLoginResult
+            {
+                Success = false,
+                Error = $"Cannot reach Seerr: {ex.Message}"
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Unexpected error during Seerr OIDC login for user {UserId}", userId);
+            return new JellyseerrOidcLoginResult
+            {
+                Success = false,
+                Error = "An unexpected error occurred"
+            };
+        }
+    }
+
+    public async Task<JellyseerrAuthResult> CompleteOidcCallbackAsync(Guid userId, string slug, string callbackUrl)
+    {
+        var config = MoonfinPlugin.Instance?.Configuration;
+        var jellyseerrUrl = config?.GetEffectiveJellyseerrUrl();
+
+        if (string.IsNullOrEmpty(jellyseerrUrl))
+        {
+            return new JellyseerrAuthResult
+            {
+                Success = false,
+                Error = "Seerr URL not configured"
+            };
+        }
+
+        var state = await LoadOidcStateAsync(userId);
+        if (state == null || !string.Equals(state.Slug, slug, StringComparison.OrdinalIgnoreCase))
+        {
+            return new JellyseerrAuthResult
+            {
+                Success = false,
+                Error = "No pending OIDC login found for this user"
+            };
+        }
+
+        try
+        {
+            var cookieContainer = new CookieContainer();
+            var baseUri = new Uri(jellyseerrUrl);
+            AddCookiesToContainer(cookieContainer, baseUri, state.Cookies);
+
+            using var handler = new HttpClientHandler
+            {
+                CookieContainer = cookieContainer,
+                UseCookies = true
+            };
+            using var client = new HttpClient(handler)
+            {
+                Timeout = TimeSpan.FromSeconds(15)
+            };
+
+            var requestUrl = $"{jellyseerrUrl}/auth/oidc/callback/{Uri.EscapeDataString(slug)}";
+            var requestContent = new StringContent(
+                JsonSerializer.Serialize(new { callbackUrl }),
+                Encoding.UTF8,
+                "application/json");
+
+            using var response = await client.PostAsync(requestUrl, requestContent);
+            if (!response.IsSuccessStatusCode)
+            {
+                var errorBody = await response.Content.ReadAsStringAsync();
+                _logger.LogWarning("Seerr OIDC callback failed for user {UserId}: {Status} - {Error}",
+                    userId, response.StatusCode, errorBody);
+
+                return new JellyseerrAuthResult
+                {
+                    Success = false,
+                    Error = $"OIDC callback failed: {response.StatusCode}"
+                };
+            }
+
+            var sessionCookie = cookieContainer.GetCookies(baseUri)["connect.sid"]?.Value;
+            if (string.IsNullOrEmpty(sessionCookie) &&
+                response.Headers.TryGetValues("Set-Cookie", out var setCookieHeaders))
+            {
+                foreach (var header in setCookieHeaders)
+                {
+                    if (header.StartsWith("connect.sid=", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var value = header.Substring("connect.sid=".Length);
+                        var semicolonIdx = value.IndexOf(';');
+                        if (semicolonIdx > 0)
+                        {
+                            value = value.Substring(0, semicolonIdx);
+                        }
+                        sessionCookie = Uri.UnescapeDataString(value);
+                        break;
+                    }
+                }
+            }
+
+            if (string.IsNullOrEmpty(sessionCookie))
+            {
+                _logger.LogWarning("Seerr OIDC callback did not return a session cookie for user {UserId}", userId);
+                return new JellyseerrAuthResult
+                {
+                    Success = false,
+                    Error = "Seerr did not return a session cookie"
+                };
+            }
+
+            var userInfo = await GetSeerrUserInfoAsync(client, jellyseerrUrl);
+            if (userInfo == null)
+            {
+                return new JellyseerrAuthResult
+                {
+                    Success = false,
+                    Error = "Failed to verify Seerr user after OIDC callback"
+                };
+            }
+
+            var userInfoElement = userInfo.Value;
+            var session = new JellyseerrSession
+            {
+                JellyfinUserId = userId,
+                SessionCookie = sessionCookie,
+                JellyseerrUserId = userInfoElement.TryGetProperty("id", out var idProp) ? idProp.GetInt32() : 0,
+                Username = userInfoElement.TryGetProperty("username", out var usernameProp) ? usernameProp.GetString() ?? string.Empty : string.Empty,
+                DisplayName = userInfoElement.TryGetProperty("displayName", out var dnProp) ? dnProp.GetString() : null,
+                Avatar = userInfoElement.TryGetProperty("avatar", out var avProp) ? avProp.GetString() : null,
+                Permissions = userInfoElement.TryGetProperty("permissions", out var permProp) ? permProp.GetInt32() : 0,
+                CreatedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                LastValidated = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+            };
+
+            await SaveSessionAsync(session);
+            await ClearOidcStateAsync(userId);
+
+            _logger.LogInformation("Seerr OIDC session created for user {UserId}", userId);
+
+            return new JellyseerrAuthResult
+            {
+                Success = true,
+                JellyseerrUserId = session.JellyseerrUserId,
+                DisplayName = session.DisplayName,
+                Avatar = session.Avatar,
+                Permissions = session.Permissions
+            };
+        }
+        catch (HttpRequestException ex)
+        {
+            _logger.LogError(ex, "Failed to connect to Seerr at {Url}", jellyseerrUrl);
+            return new JellyseerrAuthResult
+            {
+                Success = false,
+                Error = $"Cannot reach Seerr: {ex.Message}"
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Unexpected error during Seerr OIDC callback for user {UserId}", userId);
+            return new JellyseerrAuthResult
+            {
+                Success = false,
+                Error = "An unexpected error occurred"
+            };
+        }
+    }
+
+    private async Task<JsonElement?> GetSeerrUserInfoAsync(HttpClient client, string jellyseerrUrl)
+    {
+        using var response = await client.GetAsync($"{jellyseerrUrl}/api/v1/auth/me");
+        if (!response.IsSuccessStatusCode)
+        {
+            return null;
+        }
+
+        var body = await response.Content.ReadAsStringAsync();
+        var userInfo = JsonSerializer.Deserialize<JsonElement?>(body, _jsonOptions);
+        if (userInfo == null || userInfo.Value.ValueKind == JsonValueKind.Undefined)
+        {
+            return null;
+        }
+
+        return userInfo;
+    }
+
+    private static Dictionary<string, string> GetCookiesFromResponse(
+        HttpResponseMessage response,
+        CookieContainer cookieContainer,
+        Uri baseUri)
+    {
+        var cookies = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (Cookie cookie in cookieContainer.GetCookies(baseUri))
+        {
+            if (!string.IsNullOrEmpty(cookie.Value))
+            {
+                cookies[cookie.Name] = cookie.Value;
+            }
+        }
+
+        if (response.Headers.TryGetValues("Set-Cookie", out var setCookieHeaders))
+        {
+            foreach (var header in setCookieHeaders)
+            {
+                var cookiePair = header.Split(';', 2)[0];
+                var equalIndex = cookiePair.IndexOf('=');
+                if (equalIndex <= 0) continue;
+
+                var name = cookiePair[..equalIndex].Trim();
+                var value = Uri.UnescapeDataString(cookiePair[(equalIndex + 1)..].Trim());
+                if (!string.IsNullOrEmpty(name) && !string.IsNullOrEmpty(value))
+                {
+                    cookies[name] = value;
+                }
+            }
+        }
+
+        return cookies;
+    }
+
+    private static void AddCookiesToContainer(
+        CookieContainer cookieContainer,
+        Uri baseUri,
+        IDictionary<string, string> cookies)
+    {
+        foreach (var kvp in cookies)
+        {
+            if (!string.IsNullOrEmpty(kvp.Key) && kvp.Value != null)
+            {
+                cookieContainer.Add(baseUri, new Cookie(kvp.Key, kvp.Value));
+            }
+        }
+    }
+
+    private string GetOidcStatePath(Guid userId) =>
+        Path.Combine(_sessionsPath, $"{userId}.oidc.json");
+
+    private async Task SaveOidcStateAsync(JellyseerrOidcState state)
+    {
+        await _lock.WaitAsync();
+        try
+        {
+            EnsureDirectory();
+            var json = JsonSerializer.Serialize(state, _jsonOptions);
+            await File.WriteAllTextAsync(GetOidcStatePath(state.JellyfinUserId), json);
+        }
+        finally
+        {
+            _lock.Release();
+        }
+    }
+
+    private async Task<JellyseerrOidcState?> LoadOidcStateAsync(Guid userId)
+    {
+        var path = GetOidcStatePath(userId);
+        if (!File.Exists(path)) return null;
+
+        await _lock.WaitAsync();
+        try
+        {
+            var json = await File.ReadAllTextAsync(path);
+            return JsonSerializer.Deserialize<JellyseerrOidcState>(json, _jsonOptions);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to load Seerr OIDC state for user {UserId}", userId);
+            return null;
+        }
+        finally
+        {
+            _lock.Release();
+        }
+    }
+
+    private async Task ClearOidcStateAsync(Guid userId)
+    {
+        await _lock.WaitAsync();
+        try
+        {
+            var path = GetOidcStatePath(userId);
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+        finally
+        {
+            _lock.Release();
         }
     }
 
@@ -554,6 +925,31 @@ public class JellyseerrSessionService
             _lock.Release();
         }
     }
+}
+
+public class JellyseerrOidcState
+{
+    [JsonPropertyName("jellyfinUserId")]
+    public Guid JellyfinUserId { get; set; }
+
+    [JsonPropertyName("slug")]
+    public string Slug { get; set; } = string.Empty;
+
+    [JsonPropertyName("returnUrl")]
+    public string? ReturnUrl { get; set; }
+
+    [JsonPropertyName("cookies")]
+    public Dictionary<string, string> Cookies { get; set; } = new();
+
+    [JsonPropertyName("createdAt")]
+    public long CreatedAt { get; set; }
+}
+
+public class JellyseerrOidcLoginResult
+{
+    public bool Success { get; set; }
+    public string? RedirectUrl { get; set; }
+    public string? Error { get; set; }
 }
 
 /// <summary>

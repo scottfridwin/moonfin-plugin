@@ -81,6 +81,90 @@ public class JellyseerrProxyController : ControllerBase
     }
 
     /// <summary>
+    /// Initiate an OpenID Connect login flow through Seerr.
+    /// </summary>
+    [HttpGet("Oidc/Login/{slug}")]
+    [Authorize]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status503ServiceUnavailable)]
+    public async Task<IActionResult> BeginOidcLogin(string slug, [FromQuery] string? returnUrl)
+    {
+        var config = MoonfinPlugin.Instance?.Configuration;
+        var jellyseerrUrl = config?.GetEffectiveJellyseerrUrl();
+        if (config?.JellyseerrEnabled != true || string.IsNullOrEmpty(jellyseerrUrl))
+        {
+            return StatusCode(StatusCodes.Status503ServiceUnavailable,
+                new { error = "Seerr integration is not enabled" });
+        }
+
+        var userId = this.GetUserIdFromClaims();
+        if (userId == null)
+        {
+            return Unauthorized(new { error = "User not authenticated" });
+        }
+
+        var result = await _sessionService.StartOidcLoginAsync(userId.Value, slug, returnUrl);
+        if (!result.Success)
+        {
+            return StatusCode(StatusCodes.Status500InternalServerError,
+                new { error = result.Error ?? "OIDC login initiation failed" });
+        }
+
+        return Ok(new { redirectUrl = result.RedirectUrl });
+    }
+
+    /// <summary>
+    /// Complete an OpenID Connect callback flow through Seerr.
+    /// </summary>
+    [HttpPost("Oidc/Callback/{slug}")]
+    [Authorize]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    [ProducesResponseType(StatusCodes.Status503ServiceUnavailable)]
+    public async Task<IActionResult> CompleteOidcCallback(string slug, [FromBody] JellyseerrOidcCallbackRequest request)
+    {
+        var config = MoonfinPlugin.Instance?.Configuration;
+        var jellyseerrUrl = config?.GetEffectiveJellyseerrUrl();
+        if (config?.JellyseerrEnabled != true || string.IsNullOrEmpty(jellyseerrUrl))
+        {
+            return StatusCode(StatusCodes.Status503ServiceUnavailable,
+                new { error = "Seerr integration is not enabled" });
+        }
+
+        var userId = this.GetUserIdFromClaims();
+        if (userId == null)
+        {
+            return Unauthorized(new { error = "User not authenticated" });
+        }
+
+        if (request == null || string.IsNullOrEmpty(request.CallbackUrl))
+        {
+            return BadRequest(new { error = "callbackUrl is required" });
+        }
+
+        var result = await _sessionService.CompleteOidcCallbackAsync(userId.Value, slug, request.CallbackUrl);
+        if (result == null || !result.Success)
+        {
+            return BadRequest(new
+            {
+                error = result?.Error ?? "OIDC callback failed",
+                success = false
+            });
+        }
+
+        return Ok(new
+        {
+            success = true,
+            jellyseerrUserId = result.JellyseerrUserId,
+            displayName = result.DisplayName,
+            avatar = result.Avatar,
+            permissions = result.Permissions
+        });
+    }
+
+    /// <summary>
     /// Check the current user's Seerr SSO session status.
     /// </summary>
     /// <returns>Session status including whether authenticated and user info.</returns>
@@ -286,4 +370,15 @@ public class JellyseerrLoginRequest
     /// Determines which Seerr auth endpoint is used.
     /// </summary>
     public string? AuthType { get; set; }
+}
+
+/// <summary>
+/// Request body for Seerr OIDC callback.
+/// </summary>
+public class JellyseerrOidcCallbackRequest
+{
+    /// <summary>
+    /// The full URL returned by the OpenID Connect provider, including code and state.
+    /// </summary>
+    public string? CallbackUrl { get; set; }
 }

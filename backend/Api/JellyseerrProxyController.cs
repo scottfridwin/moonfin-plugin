@@ -1,3 +1,4 @@
+using System.IO;
 using System.Net.Mime;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
@@ -119,6 +120,28 @@ public class JellyseerrProxyController : ControllerBase
         }
 
         return Ok(new { redirectUrl = result.RedirectUrl });
+    }
+
+    /// <summary>
+    /// Serves the Seerr OIDC callback helper page.
+    /// </summary>
+    [HttpGet("Oidc/CallbackPage/{slug}")]
+    [AllowAnonymous]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    public IActionResult GetOidcCallbackPage(string slug)
+    {
+        var assembly = typeof(JellyseerrProxyController).Assembly;
+        const string resourceName = "Moonfin.Server.Pages.oidcCallbackPage.html";
+
+        using var stream = assembly.GetManifestResourceStream(resourceName);
+        if (stream == null)
+        {
+            return NotFound(new { error = "OIDC callback page not found" });
+        }
+
+        using var reader = new StreamReader(stream);
+        var html = reader.ReadToEnd();
+        return Content(html, "text/html; charset=utf-8");
     }
 
     /// <summary>

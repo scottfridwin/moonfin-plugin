@@ -288,21 +288,23 @@ public class JellyseerrSessionService
             using var handler = new HttpClientHandler
             {
                 CookieContainer = cookieContainer,
-                UseCookies = true
+                UseCookies = true,
+                AllowAutoRedirect = false
             };
             using var client = new HttpClient(handler)
             {
                 Timeout = TimeSpan.FromSeconds(15)
             };
 
-            var loginUrl = $"{jellyseerrUrl}/auth/oidc/login/{Uri.EscapeDataString(slug)}";
+            var loginUrl = $"{jellyseerrUrl}/api/v1/auth/oidc/login/{Uri.EscapeDataString(slug)}";
             if (!string.IsNullOrEmpty(returnUrl))
             {
                 loginUrl += $"?returnUrl={Uri.EscapeDataString(returnUrl)}";
             }
 
             using var response = await client.GetAsync(loginUrl, HttpCompletionOption.ResponseHeadersRead);
-            if (!response.IsSuccessStatusCode)
+            if (!response.IsSuccessStatusCode &&
+                (response.StatusCode < HttpStatusCode.MultipleChoices || response.StatusCode >= HttpStatusCode.BadRequest))
             {
                 var errorBody = await response.Content.ReadAsStringAsync();
                 _logger.LogWarning("Seerr OIDC login initiation failed for user {UserId}: {Status} - {Error}",
@@ -315,21 +317,42 @@ public class JellyseerrSessionService
                 };
             }
 
-            var responseBody = await response.Content.ReadAsStringAsync();
-            var payload = JsonSerializer.Deserialize<JsonElement>(responseBody);
-
-            if (!payload.TryGetProperty("redirectUrl", out var redirectElement) ||
-                redirectElement.ValueKind != JsonValueKind.String ||
-                string.IsNullOrEmpty(redirectElement.GetString()))
+            string? redirectUrl = null;
+            if (response.Headers.Location != null)
             {
+                redirectUrl = response.Headers.Location.IsAbsoluteUri
+                    ? response.Headers.Location.ToString()
+                    : new Uri(new Uri(jellyseerrUrl), response.Headers.Location).ToString();
+            }
+            else
+            {
+                var responseBody = await response.Content.ReadAsStringAsync();
+                try
+                {
+                    var payload = JsonSerializer.Deserialize<JsonElement>(responseBody);
+                    if (payload.TryGetProperty("redirectUrl", out var redirectElement) &&
+                        redirectElement.ValueKind == JsonValueKind.String)
+                    {
+                        redirectUrl = redirectElement.GetString();
+                    }
+                }
+                catch (JsonException)
+                {
+                    _logger.LogDebug("Seerr OIDC login response is not JSON; body length={Length}", responseBody.Length);
+                }
+            }
+
+            if (string.IsNullOrEmpty(redirectUrl))
+            {
+                var errorBody = await response.Content.ReadAsStringAsync();
+                _logger.LogWarning("Seerr OIDC login did not return a redirect URL for user {UserId}. Response code: {Status}.", userId, response.StatusCode);
+
                 return new JellyseerrOidcLoginResult
                 {
                     Success = false,
-                    Error = "Invalid OIDC login response from Seerr"
+                    Error = "Seerr OIDC login initiation did not return a redirect URL"
                 };
             }
-
-            var redirectUrl = redirectElement.GetString()!;
             var state = new JellyseerrOidcState
             {
                 JellyfinUserId = userId,
@@ -416,7 +439,7 @@ public class JellyseerrSessionService
                 Timeout = TimeSpan.FromSeconds(15)
             };
 
-            var requestUrl = $"{jellyseerrUrl}/auth/oidc/callback/{Uri.EscapeDataString(slug)}";
+            var requestUrl = $"{jellyseerrUrl}/api/v1/auth/oidc/callback/{Uri.EscapeDataString(slug)}";
             var requestContent = new StringContent(
                 JsonSerializer.Serialize(new { callbackUrl }),
                 Encoding.UTF8,

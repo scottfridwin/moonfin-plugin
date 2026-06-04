@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <title>Seerr OIDC Callback</title>
+    <style>
+        body {
+            margin: 0;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #f3f5f7;
+            color: #111;
+        }
+        .page {
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+        }
+        .card {
+            width: 100%;
+            max-width: 680px;
+            background: #fff;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.08);
+            padding: 28px;
+            border: 1px solid rgba(0, 0, 0, 0.05);
+        }
+        h1 {
+            margin: 0 0 12px;
+            font-size: 1.6rem;
+        }
+        p {
+            margin: 0.75rem 0;
+            line-height: 1.6;
+        }
+        pre {
+            margin: 1rem 0 0;
+            padding: 1rem;
+            border-radius: 12px;
+            background: #f7f8fa;
+            overflow-x: auto;
+            font-size: 0.95rem;
+        }
+        .button-link {
+            display: inline-block;
+            margin-top: 1rem;
+            padding: 0.8rem 1.2rem;
+            border-radius: 12px;
+            color: #ffffff;
+            background: #0078d4;
+            text-decoration: none;
+            font-weight: 600;
+        }
+    </style>
+</head>
+<body>
+    <div class="page">
+        <div class="card">
+            <h1>Seerr OIDC Callback</h1>
+            <p id="message">Completing the Seerr login flow...</p>
+            <pre id="details" style="display:none"></pre>
+            <div id="actions"></div>
+        </div>
+    </div>
+    <script>
+        const messageEl = document.getElementById('message');
+        const detailsEl = document.getElementById('details');
+        const actionsEl = document.getElementById('actions');
+
+        function showMessage(text) {
+            messageEl.textContent = text;
+        }
+
+        function showDetails(text) {
+            detailsEl.textContent = text;
+            detailsEl.style.display = 'block';
+        }
+
+        function showActionLink(text, href) {
+            actionsEl.innerHTML = '<a class="button-link" href="' + href + '">' + text + '</a>';
+        }
+
+        function getSlugFromPath() {
+            var segments = window.location.pathname.split('/').filter(Boolean);
+            return segments.length ? segments[segments.length - 1] : '';
+        }
+
+        async function completeCallback() {
+            var slug = getSlugFromPath();
+            if (!slug) {
+                showMessage('Missing OIDC provider slug in callback URL.');
+                return;
+            }
+
+            var callbackUrl = window.location.href;
+            try {
+                var response = await fetch('/Moonfin/Jellyseerr/Oidc/Callback/' + encodeURIComponent(slug), {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ callbackUrl: callbackUrl })
+                });
+                var payload = await response.text();
+                var data = {};
+                try {
+                    data = payload ? JSON.parse(payload) : {};
+                } catch (error) {
+                    data = { error: payload || 'Unexpected callback response' };
+                }
+
+                if (!response.ok) {
+                    showMessage('Unable to complete Seerr OIDC login.');
+                    showDetails(data.error || data.Error || ('HTTP ' + response.status));
+                    showActionLink('Return to Moonfin', '/');
+                    return;
+                }
+
+                if (data.success) {
+                    showMessage('Seerr OIDC login completed successfully.');
+                    showDetails('You should now be authenticated with Seerr in Moonfin. Return to the plugin settings or refresh the status.');
+                    showActionLink('Return to Moonfin', '/');
+                    return;
+                }
+
+                showMessage('Seerr OIDC login completed with errors.');
+                showDetails(data.error || 'Unknown error');
+                showActionLink('Return to Moonfin', '/');
+            } catch (error) {
+                showMessage('Failed to complete Seerr OIDC login.');
+                showDetails(error && error.message ? error.message : String(error));
+                showActionLink('Return to Moonfin', '/');
+            }
+        }
+
+        completeCallback();
+    </script>
+</body>
+</html>
